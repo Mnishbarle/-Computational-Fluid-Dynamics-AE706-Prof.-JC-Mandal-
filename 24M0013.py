@@ -1,295 +1,205 @@
+# Importing necessary libraries
 import numpy as np
 import matplotlib.pyplot as plt
+from scipy.optimize import fsolve
 
-# Parameters
-L = 1.0          # Cavity size (m)
-I = 31           # Grid points (31x31)
-J = 31
-Re = 100         # Reynolds number
-nu = 1.0 / Re    # Kinematic viscosity
-sig_c = 0.4    # Courant number (convective)
-sig_d = 0.6    # Diffusion number
-dx = L / 30 # Grid spacing
-dy = dx
-RMS_threshold = 1e-8  # Convergence threshold for velocities
-max_steps = 10000   # Maximum time steps
+# Constants
+gamma = 1.4
+R = 287.0
+p0 = 1.0133e5
+T0 = 300.0
+pe_p0 = 0.585
+CFL = 0.5
+Imax = 101
+tol = 1e-8
 
-# Initialize arrays
-psi = np.full((I, J), 100.0)  # Stream function (ψ = 100 everywhere initially)
-omega = np.zeros((I, J))      # Vorticity (ω = 0 initially)
-u = np.zeros((I, J))          # x-velocity
-v = np.zeros((I, J))          # y-velocity
+# Grid setup
+x = np.linspace(0, 2, Imax)
+dx = x[1] - x[0]
+A = 1 + 2 * (x - 1)**2
+shock_idx = np.argmin(np.abs(x - 1.7))  # Index closest to x = 1.7
 
-# Function to apply boundary conditions
-def apply_boundary_conditions(psi, omega, u, v):
-    """
-    Apply boundary conditions for vorticity, stream function, and velocity.
-    Top wall: u = 1 m/s, v = 0, ψ = 100.
-    Bottom, left, right walls: u = v = 0, ψ = 100.
-    Vorticity computed using assignment formulas.
-    """
-    # Top wall (y = 1, j = J-1)
-    psi[:, -1] = 100.0
-    u[:, -1] = 1.0
-    v[:, -1] = 0.0
-    omega[:, -1] = -2 * (psi[:, -2] - psi[:, -1]) / dy**2 - 2 * u[:, -1] / dy
+# Initialize flow
+def initialize_flow():
+    rho0 = p0 / (R * T0)                                      # Calculating the density
+    U = np.zeros((3, Imax))                                   # Creating a dummy variable U (velocity)
+    U[0, :] = rho0 * A                                      
+    U[1, :] = rho0 * 100 * A                                  # Initial velocity 100 m/s
+    U[2, :] = p0 / (gamma - 1) * A + 0.5 * rho0 * 100**2 * A
+    return U
 
-    # Bottom wall (y = 0, j = 0)
-    psi[:, 0] = 100.0
-    u[:, 0] = 0.0
-    v[:, 0] = 0.0
-    omega[:, 0] = -2 * (psi[:, 1] - psi[:, 0]) / dy**2
+# Primitive variables
+def get_primitives(U):
+    rho = U[0, :] / A
+    u = U[1, :] / (rho * A + 1e-10)
+    E = U[2, :] / A
+    p = (gamma - 1) * (E - 0.5 * rho * u**2)
+    p = np.maximum(p, 1e-10)
+    T = p / (rho * R)
+    a = np.sqrt(gamma * R * T)              # Speed of sound
+    M = u / a                               # Mach number
+    return rho, u, p, a, M
 
-    # Left wall (x = 0, i = 0)
-    psi[0, :] = 100.0
-    u[0, :] = 0.0
-    v[0, :] = 0.0
-    omega[0, :] = -2 * (psi[1, :] - psi[0, :]) / dx**2
+# Van Leer Flux Vector Splitting with while loop
+def van_leer_flux(U):
+    rho, u, p, a, M = get_primitives(U)
+    F_plus = np.zeros((3, Imax))
+    F_minus = np.zeros((3, Imax))
+    F = np.zeros((3, Imax))
+    
+    F[0, :] = rho * u * A
+    F[1, :] = (rho * u**2 + p) * A
+    F[2, :] = u * (U[2, :] + p * A)
+    
+    i = 0  # Initialize index
+    while i < Imax:
+        if M[i] <= -1:
+            F_plus[:, i] = 0
+            F_minus[:, i] = F[:, i]
+        elif M[i] >= 1:
+            F_plus[:, i] = F[:, i]
+            F_minus[:, i] = 0
+        else:
+            f_mass_plus = 0.25 * rho[i] * a[i] * (M[i] + 1)**2 * A[i]
+            f_mass_minus = -0.25 * rho[i] * a[i] * (M[i] - 1)**2 * A[i]
+            f_mom_plus = f_mass_plus * ((gamma - 1) * u[i] + 2 * a[i]) / gamma
+            f_mom_minus = f_mass_minus * ((gamma - 1) * u[i] - 2 * a[i]) / gamma
+            f_energy_plus = f_mass_plus * ((gamma - 1) * u[i] + 2 * a[i])**2 / (2 * (gamma**2 - 1))
+            f_energy_minus = f_mass_minus * ((gamma - 1) * u[i] - 2 * a[i])**2 / (2 * (gamma**2 - 1))
+            
+            F_plus[0, i] = f_mass_plus
+            F_plus[1, i] = f_mom_plus
+            F_plus[2, i] = f_energy_plus
+            F_minus[0, i] = f_mass_minus
+            F_minus[1, i] = f_mom_minus
+            F_minus[2, i] = f_energy_minus
+        i += 1  # Increment index
+    
+    return F_plus, F_minus
 
-    # Right wall (x = 1, i = I-1)
-    psi[-1, :] = 100.0
-    u[-1, :] = 0.0
-    v[-1, :] = 0.0
-    omega[-1, :] = -2 * (psi[-2, :] - psi[-1, :]) / dx**2
+# Source term
+def source_term(U):
+    _, _, p, _, _ = get_primitives(U)
+    dA_dx = np.zeros(Imax)
+    dA_dx[1:-1] = (A[2:] - A[:-2]) / (2 * dx)
+    S = np.zeros((3, Imax))
+    S[1, :] = p * dA_dx
+    return S
 
-# Function to compute time step based on stability conditions
-def compute_time_step(u, v):
-    """
-    Compute time step Δt based on convective and diffusive stability conditions.
-    Δt = min(Δt_c, Δt_d).
-    """
-    u_max = np.max(np.abs(u)) + 1e-10  # Avoid division by zero
-    v_max = np.max(np.abs(v)) + 1e-10
-    dt_c = sig_c * (dx * dy) / (u_max * dy + v_max * dx)
-    dt_d = sig_d * (dx**2 * dy**2) / (2 * nu * (dx**2 + dy**2))
-    return min(dt_c, dt_d)
+# Time step
+def compute_dt(U):
+    _, u, _, a, _ = get_primitives(U)
+    lambda_max = np.max(np.abs(u) + a)
+    return CFL * dx / lambda_max
 
-# Function to compute second-order upwind derivative
-def upwind_derivative(f, u, delta, axis):
-    """
-    Compute second-order upwind derivative for convective terms.
-    f: field (e.g., vorticity), u: velocity component, delta: grid spacing.
-    axis: 0 for x-direction, 1 for y-direction.
-    """
-    df = np.zeros_like(f)
-    if axis == 0:  # x-direction
-        i = 2
-        while i < I-2:  # Avoid i+2 out of bounds
-            j = 1
-            while j < J-1:
-                if u[i,j] >= 0:
-                    df[i,j] = (3*f[i,j] - 4*f[i-1,j] + f[i-2,j]) / (2*delta)
-                else:
-                    df[i,j] = (-f[i+2,j] + 4*f[i+1,j] - 3*f[i,j]) / (2*delta)
-                j += 1
-            i += 1
-        # Near boundaries (i=I-2, J-1), use first-order upwind
-        for i in [I-2, J-1]:  # For loop kept as it's more clear for this specific case
-            j = 1
-            while j < J-1:
-                if u[i,j] >= 0 and i >= 1:
-                    df[i,j] = (f[i,j] - f[i-1,j]) / delta
-                else:
-                    df[i,j] = 0  # Safe fallback
-                j += 1
-    else:  # y-direction
-        i = 1
-        while i < J-1:
-            j = 2
-            while j < J-2:  # Avoid j+2 out of bounds
-                if u[i,j] >= 0:
-                    df[i,j] = (3*f[i,j] - 4*f[i,j-1] + f[i,j-2]) / (2*delta)
-                else:
-                    df[i,j] = (-f[i,j+2] + 4*f[i,j+1] - 3*f[i,j]) / (2*delta)
-                j += 1
-            i += 1
-        # Near boundaries (j=J-2, J-1), use first-order upwind
-        i = 1
-        while i < J-1:
-            for j in [I-2, J-1]:  # For loop kept as it's more clear for this specific case
-                if u[i,j] >= 0 and j >= 1:
-                    df[i,j] = (f[i,j] - f[i,j-1]) / delta
-                else:
-                    df[i,j] = 0  # Safe fallback
-            i += 1
-    return df
+# Boundary conditions
+def apply_boundary(U):
+    rho, u, p, a, _ = get_primitives(U)
+    u[0] = u[1]
+    M_in = u[0] / a[0]
+    p[0] = p0 * (1 + (gamma - 1) / 2 * M_in**2)**(-gamma / (gamma - 1))
+    rho[0] = p[0] / (R * T0 * (p[0] / p0)**((gamma - 1) / gamma))
+    p[-1] = pe_p0 * p0
+    rho[-1] = rho[-2]
+    u[-1] = u[-2]
+    U[0, :] = rho * A
+    U[1, :] = rho * u * A
+    U[2, :] = (p / (gamma - 1) + 0.5 * rho * u**2) * A
+    return U
 
-# Function to update vorticity using vorticity transport equation
-def update_vorticity(psi, omega, u, v, dt):
-    """
-    Update vorticity using the vorticity transport equation
-    Uses second-order upwind for convection, central differences for diffusion.
-    """
-    omega_new = omega.copy()
-    # Compute derivatives
-    domega_dx = upwind_derivative(omega, u, dx, axis=0)
-    domega_dy = upwind_derivative(omega, v, dy, axis=1)
-    d2omega_dx2 = (omega[2:, 1:-1] - 2*omega[1:-1, 1:-1] + omega[:-2, 1:-1]) / dx**2
-    d2omega_dy2 = (omega[1:-1, 2:] - 2*omega[1:-1, 1:-1] + omega[1:-1, :-2]) / dy**2
-    # Update vorticity (explicit Euler)
-    convection = u[1:-1, 1:-1] * domega_dx[1:-1, 1:-1] + v[1:-1, 1:-1] * domega_dy[1:-1, 1:-1]
-    diffusion = nu * (d2omega_dx2 + d2omega_dy2)
-    omega_new[1:-1, 1:-1] = omega[1:-1, 1:-1] + dt * (-convection + diffusion)
-    return omega_new
+# Exact solution with shock
+def exact_solution():
+    p_exact = np.zeros(Imax)
+    M_exact = np.zeros(Imax)
+    A_star = 1.0
+    
+    # Before shock (x <= 1.7)
+    for i in range(Imax):
+        if x[i] <= 1.7:
+            def area_ratio(M):
+                return (1 / M) * (2 / (gamma + 1) * (1 + (gamma - 1) / 2 * M**2))**((gamma + 1) / (2 * (gamma - 1))) - A[i] / A_star
+            M_guess = 1.0 if x[i] == 1.0 else (0.5 if x[i] < 1.0 else 1.5)
+            M_exact[i] = fsolve(area_ratio, M_guess)[0]
+            p_exact[i] = p0 * (1 + (gamma - 1) / 2 * M_exact[i]**2)**(-gamma / (gamma - 1))
+    
+    # Shock at x = 1.7
+    M1 = M_exact[shock_idx]
+    p1 = p_exact[shock_idx]
+    M2 = np.sqrt(((gamma - 1) * M1**2 + 2) / (2 * gamma * M1**2 - (gamma - 1)))
+    p2 = p1 * (2 * gamma * M1**2 - (gamma - 1)) / (gamma + 1)
+    
+    # After shock (x > 1.7)
+    for i in range(shock_idx + 1, Imax):
+        def area_ratio_post(M):
+            return (1 / M) * (2 / (gamma + 1) * (1 + (gamma - 1) / 2 * M**2))**((gamma + 1) / (2 * (gamma - 1))) - A[i] / A[shock_idx] * (1 / M2) * (2 / (gamma + 1) * (1 + (gamma - 1) / 2 * M2**2))**((gamma + 1) / (2 * (gamma - 1)))
+        M_exact[i] = fsolve(area_ratio_post, 0.6)[0]
+        p_exact[i] = p2 * (1 + (gamma - 1) / 2 * M2**2)**(gamma / (gamma - 1)) / (1 + (gamma - 1) / 2 * M_exact[i]**2)**(gamma / (gamma - 1))
+    
+    return p_exact / p0, M_exact
 
-# Function to solve stream function equation using Gauss-Seidel
-def solve_stream_function(psi, omega, tol=1e-2, max_iter=1000):
-    """
-    Solve Poisson equation using Gauss-Seidel iteration.
-    Stop when RMS residual ≤ 10^-2.
-    """
-    psi_new = psi.copy()
-    iteration = 0
-    while iteration < max_iter:
-        psi_old = psi_new.copy()
-        # Gauss-Seidel update
-        i = 1
-        while i < I-1:
-            j = 1
-            while j < J-1:
-                psi_new[i,j] = 0.25 * ( psi_new[i+1,j] + psi_new[i-1,j] + psi_new[i,j+1] + psi_new[i,j-1] + dx**2 * omega[i,j] )
-                j += 1
-            i += 1
+# Solver
+U = initialize_flow()
+max_iter = 20000
+residual = 1.0
+iter_count = 0
 
-        # Compute residual
-        residual = (
-            (psi_new[2:, 1:-1] - 2*psi_new[1:-1, 1:-1] + psi_new[:-2, 1:-1]) / dx**2 +
-            (psi_new[1:-1, 2:] - 2*psi_new[1:-1, 1:-1] + psi_new[1:-1, :-2]) / dy**2 +
-            omega[1:-1, 1:-1]
-        )
-        R2 = np.sqrt(np.mean(residual**2))
-        if R2 < tol:
-            break
-        iteration += 1
-    return psi_new
+while residual > tol and iter_count < max_iter:
+    U_old = U.copy()
+    dt = compute_dt(U)
+    F_plus, F_minus = van_leer_flux(U)
+    S = source_term(U)
+    U_new = U.copy()
+    U_new[:, 1:-1] = U[:, 1:-1] - dt / dx * (F_plus[:, 1:-1] - F_plus[:, :-2]) - dt / dx * (F_minus[:, 2:] - F_minus[:, 1:-1]) + dt * S[:, 1:-1]
+    U = apply_boundary(U_new)
+    residual = np.sqrt(np.sum((U - U_old)**2) / (3 * Imax))
+    iter_count += 1
+    if iter_count % 2000 == 0:
+        _, _, p_temp, _, M_temp = get_primitives(U)
+        print(f"Iteration {iter_count}, Residual = {residual:.2e}, Exit p/p0 = {p_temp[-1]/p0:.3f}, Exit M = {M_temp[-1]:.3f}")
 
-# Function to compute velocities from stream function
-def compute_velocities(psi):
-    """
-    Compute velocity components from the definition of stream functions
-    Uses central differences
-    """
-    u = np.zeros((I, J))
-    v = np.zeros((I, J))
-    u[1:-1, 1:-1] = (psi[1:-1, 2:] - psi[1:-1, :-2]) / (2 * dy)
-    v[1:-1, 1:-1] = -(psi[2:, 1:-1] - psi[:-2, 1:-1]) / (2 * dx)
-    return u, v
+print(f"Converged after {iter_count} iterations with residual = {residual:.2e}")
 
-# Main simulation loop
-RMS_u_history = []
-RMS_v_history = []
-step = 0
-while step < max_steps:
-    # Apply boundary conditions at the start of each step
-    apply_boundary_conditions(psi, omega, u, v)
+# Results
+_, _, p, _, M = get_primitives(U)
+p_p0 = p / p0
+p_exact, M_exact = exact_solution()
 
-    # Compute velocities (old)
-    u_old, v_old = compute_velocities(psi)
+# Numerical shock location
+M_diff = np.abs(np.diff(M))
+num_shock_idx = shock_idx - 1 + np.argmax(M_diff[shock_idx-5:shock_idx+5])
+M_pre_num = M[num_shock_idx]
+M_post_num = M[num_shock_idx + 1]
 
-    # Compute time step
-    dt = compute_time_step(u_old, v_old)
+# Theoretical shock values
+M_pre_theory = M_exact[shock_idx]
+M_post_theory = M_exact[shock_idx + 1]
 
-    # Update vorticity
-    omega = update_vorticity(psi, omega, u_old, v_old, dt)
+# Exit values
+p_exit_num = p[-1]
+M_exit_num = M[-1]
+p_exit_exact = p0 * pe_p0
+M_exit_exact = M_exact[-1]
+print(f"Numerical Exit Pressure: {p_exit_num:.2f} Pa, p_e/p_0: {p_exit_num/p0:.3f}")
+print(f"Theoretical Exit Pressure: {p_exit_exact:.2f} Pa, p_e/p_0: {pe_p0:.3f}")
+print(f"Numerical Exit Mach Number: {M_exit_num:.3f}")
+print(f"Theoretical Exit Mach Number: {M_exit_exact:.3f}")
 
-    # Solve stream function
-    psi = solve_stream_function(psi, omega)
-
-    # Compute velocities (new)
-    u_new, v_new = compute_velocities(psi)
-
-    # Update boundary velocities explicitly (to ensure consistency)
-    u_new[:, -1] = 1.0  # Top wall
-    u_new[:, 0] = 0.0   # Bottom wall
-    u_new[0, :] = 0.0   # Left wall
-    u_new[-1, :] = 0.0  # Right wall
-    v_new[:, -1] = 0.0  # Top wall
-    v_new[:, 0] = 0.0   # Bottom wall
-    v_new[0, :] = 0.0   # Left wall
-    v_new[-1, :] = 0.0  # Right wall
-
-    # Compute RMS residuals
-    RMS_u = np.sqrt(np.mean((u_new[1:-1, 1:-1] - u_old[1:-1, 1:-1])**2))
-    RMS_v = np.sqrt(np.mean((v_new[1:-1, 1:-1] - v_old[1:-1, 1:-1])**2))
-    RMS_u_history.append(RMS_u)
-    RMS_v_history.append(RMS_v)
-
-    # Print progress
-    if step % 1000 == 0:
-        print(f"Step {step}, RMS_u: {RMS_u:.2e}, RMS_v: {RMS_v:.2e}, u_max: {np.max(np.abs(u_new)):.2e}, v_max: {np.max(np.abs(v_new)):.2e}")
-
-    # Check convergence
-    if RMS_u < RMS_threshold and RMS_v < RMS_threshold:
-        print(f"Converged at step {step}")
-        break
-        
-    step += 1
-
-# Ghia et al. benchmark data from csv file
-# Mid vertical line (x-velocity, u at x=0.5)
-ghia_u_y = np.array([1, 0.9766, 0.9688, 0.9609, 0.9531, 0.8516, 0.7344, 0.6172, 
-                     0.5, 0.4531, 0.2813, 0.1719, 0.1016, 0.0703, 0.0625, 0.0547, 0])
-ghia_u = np.array([1, 0.84123, 0.78871, 0.73722, 0.68717, 0.23151, 0.00332, -0.13641, 
-                   -0.20581, -0.2109, -0.15662, -0.1015, -0.06434, -0.04775, -0.04192, -0.03717, 0])
-
-# Mid horizontal line (y-velocity, v at y=0.5)
-ghia_v_x = np.array([1, 0.9688, 0.9609, 0.9531, 0.9453, 0.9063, 0.8594, 0.8047, 
-                     0.5, 0.2344, 0.2266, 0.1563, 0.0938, 0.0781, 0.0703, 0.0625, 0])
-ghia_v = np.array([0, -0.05906, -0.07391, -0.08864, -0.10313, -0.16914, -0.22445, -0.24533, 
-                   0.05454, 0.17527, 0.17507, 0.16077, 0.12317, 0.1089, 0.10091, 0.09233, 0])
-
-# Generate plots
-x = np.linspace(0, L, I)
-y = np.linspace(0, L, J)
-X, Y = np.meshgrid(x, y)
-
-# 1. Stream function contours
-plt.figure(figsize=(6, 6))
-contour = plt.contourf(X, Y, psi.T, levels=20, cmap='viridis')
-plt.colorbar(contour, label='Stream Function (ψ)')
-plt.title("Stream Function Contours")
-plt.xlabel("x (m)")
-plt.ylabel("y (m)")
-plt.show()
-
-# 2. Streamlines
-plt.figure(figsize=(6, 6))
-plt.streamplot(X, Y, u_new.T, v_new.T, density=1.5, color='black')
-plt.title("Streamlines")
-plt.xlabel("x (m)")
-plt.ylabel("y (m)")
-plt.grid(True)
-plt.show()
-
-# 3. u-velocity along vertical midline (x = 0.5)
-plt.figure(figsize=(6, 6))
-plt.plot(u_new[I//2, :], y, label="Computed u at x=0.5", color='blue')
-plt.plot(ghia_u, ghia_u_y, 'ro', label="Ghia et al. u", markersize=5)
-plt.xlabel("u (m/s)")
-plt.ylabel("y (m)")
-plt.title("u-velocity along x=0.5")
+# Plotting
+plt.figure(figsize=(12, 5))
+plt.subplot(1, 2, 1)
+plt.plot(x, p_p0, 'b', label='Numerical')
+plt.plot(x, p_exact, 'r--', label='Exact')
+plt.xlabel('x (in m)')
+plt.ylabel('p/p0')
 plt.legend()
-plt.grid(True)
-plt.show()
+plt.title('Non-Dimensional Pressure Ratio')
 
-# 4. v-velocity along horizontal midline (y = 0.5)
-plt.figure(figsize=(6, 6))
-plt.plot(x, v_new[:, J//2], label="Computed v at y=0.5", color='blue')
-plt.plot(ghia_v_x, ghia_v, 'ro', label="Ghia et al. v", markersize=5)
-plt.xlabel("x (m)")
-plt.ylabel("v (m/s)")
-plt.title("v-velocity along y=0.5")
+plt.subplot(1, 2, 2)
+plt.plot(x, M, 'b-', label='Numerical')
+plt.plot(x, M_exact, 'r--', label='Exact')
+plt.xlabel('x(in m)')
+plt.ylabel('Mach Number')
 plt.legend()
-plt.grid(True)
-plt.show()
-
-# 5. Convergence history
-plt.figure(figsize=(6, 6))
-plt.semilogy(RMS_u_history, label="RMS_u", color='blue')
-plt.semilogy(RMS_v_history, label="RMS_v", color='red')
-plt.xlabel("Iteration")
-plt.ylabel("RMS Residual")
-plt.title("Convergence History")
-plt.legend()
-plt.grid(True)
+plt.title('Mach Number')
+plt.tight_layout()
 plt.show()
